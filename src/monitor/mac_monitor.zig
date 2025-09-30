@@ -20,7 +20,7 @@ pub const MacUsbMonitor = struct {
     removed_iterator: c.io_iterator_t,
     monitor_ref: ?*daemon.UsbDeviceMonitor,
     is_running: bool,
-    
+
     // Debouncing fields
     last_connect_time: i64,
     last_disconnect_time: i64,
@@ -188,19 +188,19 @@ pub const MacUsbMonitor = struct {
         const current_time = std.time.milliTimestamp();
         const time_since_last_connect = current_time - self.last_connect_time;
         const time_since_last_disconnect = current_time - self.last_disconnect_time;
-        
+
         // If we just had a disconnect event recently, wait longer before allowing connect
         if (time_since_last_disconnect < self.debounce_delay_ms) {
             logger.debug("MacUsbMonitor: Debouncing connect event ({}ms since disconnect)", .{time_since_last_disconnect});
             return true;
         }
-        
+
         // If we had a recent connect event, debounce
         if (time_since_last_connect < self.debounce_delay_ms) {
             logger.debug("MacUsbMonitor: Debouncing connect event ({}ms since last connect)", .{time_since_last_connect});
             return true;
         }
-        
+
         self.last_connect_time = current_time;
         self.device_state_stable = false; // Mark as unstable during transition
         return false;
@@ -210,19 +210,19 @@ pub const MacUsbMonitor = struct {
         const current_time = std.time.milliTimestamp();
         const time_since_last_disconnect = current_time - self.last_disconnect_time;
         const time_since_last_connect = current_time - self.last_connect_time;
-        
+
         // If we just had a connect event recently, wait longer before allowing disconnect
         if (time_since_last_connect < self.debounce_delay_ms) {
             logger.debug("MacUsbMonitor: Debouncing disconnect event ({}ms since connect)", .{time_since_last_connect});
             return true;
         }
-        
+
         // If we had a recent disconnect event, debounce
         if (time_since_last_disconnect < self.debounce_delay_ms) {
             logger.debug("MacUsbMonitor: Debouncing disconnect event ({}ms since last disconnect)", .{time_since_last_disconnect});
             return true;
         }
-        
+
         self.last_disconnect_time = current_time;
         self.device_state_stable = false; // Mark as unstable during transition
         return false;
@@ -252,7 +252,7 @@ pub const MacUsbMonitor = struct {
 
     fn handleDeviceAdded(self: *Self, iterator: c.io_iterator_t) void {
         logger.debug("MacUsbMonitor: handleDeviceAdded called", .{});
-        
+
         // Check if we should debounce this connect event
         if (self.shouldDebounceConnectEvent()) {
             // Still need to consume the iterator to prevent memory leaks
@@ -263,7 +263,7 @@ pub const MacUsbMonitor = struct {
             }
             return;
         }
-        
+
         var service: c.io_service_t = c.IOIteratorNext(iterator);
         while (service != 0) {
             defer _ = c.IOObjectRelease(service);
@@ -289,7 +289,7 @@ pub const MacUsbMonitor = struct {
 
     fn handleDeviceRemoved(self: *Self, iterator: c.io_iterator_t) void {
         logger.debug("MacUsbMonitor: handleDeviceRemoved called", .{});
-        
+
         // Check if we should debounce this disconnect event
         if (self.shouldDebounceDisconnectEvent()) {
             // Still need to consume the iterator to prevent memory leaks
@@ -300,7 +300,7 @@ pub const MacUsbMonitor = struct {
             }
             return;
         }
-        
+
         var service: c.io_service_t = c.IOIteratorNext(iterator);
         while (service != 0) {
             defer _ = c.IOObjectRelease(service);
@@ -328,18 +328,18 @@ pub const MacUsbMonitor = struct {
         // Extract real device properties from IOService
         var properties: c.CFMutableDictionaryRef = undefined;
         const result = c.IORegistryEntryCreateCFProperties(service, &properties, c.kCFAllocatorDefault, 0);
-        
+
         if (result != c.KERN_SUCCESS) {
             // Fallback to basic device info if properties can't be read
             const name = try self.allocator.dupe(u8, "Unknown USB Device");
             const vendor_id = try self.allocator.dupe(u8, "0000");
             const product_id = try self.allocator.dupe(u8, "0000");
-            
+
             return UsbDevice.init(name, vendor_id, product_id, null, null, null);
         }
-        
+
         defer c.CFRelease(properties);
-        
+
         // Extract device name (try multiple possible keys)
         var device_name: []const u8 = "Unknown USB Device";
         if (self.getCFStringProperty(properties, "USB Product Name")) |name| {
@@ -349,31 +349,31 @@ pub const MacUsbMonitor = struct {
         } else if (self.getCFStringProperty(properties, "IORegistryEntryName")) |name| {
             device_name = name;
         }
-        
+
         // Extract vendor ID
         var vendor_id_str: []const u8 = "0000";
         if (self.getCFNumberProperty(properties, "idVendor")) |vendor_id| {
             vendor_id_str = try std.fmt.allocPrint(self.allocator, "0x{x:0>4}", .{vendor_id});
         }
-        
+
         // Extract product ID
         var product_id_str: []const u8 = "0000";
         if (self.getCFNumberProperty(properties, "idProduct")) |product_id| {
             product_id_str = try std.fmt.allocPrint(self.allocator, "0x{x:0>4}", .{product_id});
         }
-        
+
         // Extract product name (optional)
         const product_name = self.getCFStringProperty(properties, "USB Product Name") orelse
-                            self.getCFStringProperty(properties, "kUSBProductString");
-        
+            self.getCFStringProperty(properties, "kUSBProductString");
+
         // Extract serial number (optional)
         const serial_number = self.getCFStringProperty(properties, "USB Serial Number") orelse
-                             self.getCFStringProperty(properties, "kUSBSerialNumberString");
-        
+            self.getCFStringProperty(properties, "kUSBSerialNumberString");
+
         const name_copy = try self.allocator.dupe(u8, device_name);
         const product_name_copy = if (product_name) |pn| try self.allocator.dupe(u8, pn) else null;
         const serial_copy = if (serial_number) |sn| try self.allocator.dupe(u8, sn) else null;
-        
+
         return UsbDevice.init(
             name_copy,
             vendor_id_str,
@@ -383,51 +383,50 @@ pub const MacUsbMonitor = struct {
             null, // device_id
         );
     }
-    
+
     fn getCFStringProperty(self: *Self, properties: c.CFDictionaryRef, key: []const u8) ?[]const u8 {
         const cf_key = c.CFStringCreateWithCString(c.kCFAllocatorDefault, key.ptr, c.kCFStringEncodingUTF8);
         defer c.CFRelease(cf_key);
-        
+
         const cf_value = c.CFDictionaryGetValue(properties, cf_key);
         if (cf_value == null) return null;
-        
+
         if (c.CFGetTypeID(cf_value) != c.CFStringGetTypeID()) return null;
-        
+
         const cf_string: c.CFStringRef = @ptrCast(cf_value);
         const length = c.CFStringGetLength(cf_string);
         const max_size = c.CFStringGetMaximumSizeForEncoding(length, c.kCFStringEncodingUTF8) + 1;
-        
+
         // Allocate buffer with proper memory management
         const buffer = self.allocator.alloc(u8, @intCast(max_size)) catch return null;
         defer self.allocator.free(buffer);
-        
+
         if (c.CFStringGetCString(cf_string, buffer.ptr, @intCast(buffer.len), c.kCFStringEncodingUTF8) != 0) {
             const str_len = std.mem.len(@as([*:0]const u8, @ptrCast(buffer.ptr)));
             // Return a copy that the caller owns
             return self.allocator.dupe(u8, buffer[0..str_len]) catch null;
         }
-        
+
         return null;
     }
-    
+
     fn getCFNumberProperty(self: *Self, properties: c.CFDictionaryRef, key: []const u8) ?u32 {
         _ = self;
-        const cf_key = c.CFSt
-ingCreateWithCString(c.kCFAllocatorDefault, key.ptr, c.kCFStringEncodingUTF8);
+        const cf_key = c.CFStringCreateWithCString(c.kCFAllocatorDefault, key.ptr, c.kCFStringEncodingUTF8);
         defer c.CFRelease(cf_key);
-        
+
         const cf_value = c.CFDictionaryGetValue(properties, cf_key);
         if (cf_value == null) return null;
-        
+
         if (c.CFGetTypeID(cf_value) != c.CFNumberGetTypeID()) return null;
-        
+
         const cf_number: c.CFNumberRef = @ptrCast(cf_value);
         var value: u32 = 0;
-        
+
         if (c.CFNumberGetValue(cf_number, c.kCFNumberSInt32Type, &value) != 0) {
             return value;
         }
-        
+
         return null;
     }
 };
