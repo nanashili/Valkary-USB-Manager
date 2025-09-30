@@ -146,7 +146,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .@"usb-devices" = .{
-        .url = "https://github.com/yourusername/usb-devices-zig/archive/refs/tags/v0.1.0.tar.gz",
+        .url = "https://github.com/nanashili/Valkary-USB-Manager/archive/refs/tags/v0.0.1.tar.gz",
         .hash = "...",
     },
 },
