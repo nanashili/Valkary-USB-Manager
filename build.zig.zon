@@ -1,5 +1,5 @@
 .{
-    .name = "Valkary_USB_Manager",
+    .name = .Valkary_USB_Manager,
     .version = "0.0.1",
     .fingerprint = 0x9877ede5992ff6db,
     .minimum_zig_version = "0.15.1",
