@@ -2,6 +2,7 @@ const std = @import("std");
 const UsbDevice = @import("../usb_device.zig").UsbDevice;
 const daemon = @import("../daemon.zig");
 const mac_parser = @import("../parser/mac_parser.zig");
+const logger = @import("../logger.zig");
 
 // IOKit C bindings for USB device monitoring
 const c = @cImport({
@@ -19,6 +20,12 @@ pub const MacUsbMonitor = struct {
     removed_iterator: c.io_iterator_t,
     monitor_ref: ?*daemon.UsbDeviceMonitor,
     is_running: bool,
+    
+    // Debouncing fields
+    last_connect_time: i64,
+    last_disconnect_time: i64,
+    debounce_delay_ms: i64,
+    device_state_stable: bool,
 
     const Self = @This();
 
@@ -31,6 +38,10 @@ pub const MacUsbMonitor = struct {
             .removed_iterator = 0,
             .monitor_ref = monitor_ref,
             .is_running = false,
+            .last_connect_time = 0,
+            .last_disconnect_time = 0,
+            .debounce_delay_ms = 0,
+            .device_state_stable = true,
         };
     }
 
@@ -43,21 +54,28 @@ pub const MacUsbMonitor = struct {
             return error.AlreadyRunning;
         }
 
+        logger.debug("MacUsbMonitor: Starting IOKit monitoring...", .{});
+
         // Create notification port
         self.notification_port = c.IONotificationPortCreate(c.kIOMasterPortDefault);
         if (self.notification_port == null) {
+            logger.err("MacUsbMonitor: Failed to create notification port", .{});
             return error.FailedToCreateNotificationPort;
         }
+        logger.debug("MacUsbMonitor: Created notification port", .{});
 
         // Get run loop source
         self.run_loop_source = c.IONotificationPortGetRunLoopSource(self.notification_port.?);
         if (self.run_loop_source == null) {
+            logger.err("MacUsbMonitor: Failed to get run loop source", .{});
             self.cleanup();
             return error.FailedToGetRunLoopSource;
         }
+        logger.debug("MacUsbMonitor: Got run loop source", .{});
 
         // Add run loop source to current run loop
         c.CFRunLoopAddSource(c.CFRunLoopGetCurrent(), self.run_loop_source.?, c.kCFRunLoopDefaultMode);
+        logger.debug("MacUsbMonitor: Added run loop source to current run loop", .{});
 
         // Create matching dictionary for USB devices
         const matching_dict = c.IOServiceMatching("IOUSBDevice");
@@ -66,20 +84,23 @@ pub const MacUsbMonitor = struct {
             return error.FailedToCreateMatchingDictionary;
         }
 
-        // Register for device added notifications
+        // Register for device addition notifications
+        logger.debug("MacUsbMonitor: Registering for device addition notifications...", .{});
         const add_result = c.IOServiceAddMatchingNotification(
             self.notification_port.?,
             c.kIOFirstMatchNotification,
             matching_dict,
             deviceAddedCallback,
-            self,
+            @ptrCast(self),
             &self.added_iterator,
         );
 
         if (add_result != c.KERN_SUCCESS) {
+            logger.err("MacUsbMonitor: Failed to register for device addition notifications: {}", .{add_result});
             self.cleanup();
             return error.FailedToRegisterAddedNotification;
         }
+        logger.debug("MacUsbMonitor: Successfully registered for device addition notifications", .{});
 
         // Create another matching dictionary for removal notifications
         const matching_dict_removed = c.IOServiceMatching("IOUSBDevice");
@@ -88,25 +109,30 @@ pub const MacUsbMonitor = struct {
             return error.FailedToCreateMatchingDictionary;
         }
 
-        // Register for device removed notifications
+        // Register for device removal notifications
+        logger.debug("MacUsbMonitor: Registering for device removal notifications...", .{});
         const remove_result = c.IOServiceAddMatchingNotification(
             self.notification_port.?,
             c.kIOTerminatedNotification,
             matching_dict_removed,
             deviceRemovedCallback,
-            self,
+            @ptrCast(self),
             &self.removed_iterator,
         );
 
         if (remove_result != c.KERN_SUCCESS) {
+            logger.err("MacUsbMonitor: Failed to register for device removal notifications: {}", .{remove_result});
             self.cleanup();
             return error.FailedToRegisterRemovedNotification;
         }
+        logger.debug("MacUsbMonitor: Successfully registered for device removal notifications", .{});
 
         // Process existing devices to arm the notification
+        logger.debug("MacUsbMonitor: Processing existing devices to arm notifications...", .{});
         self.processExistingDevices();
 
         self.is_running = true;
+        logger.debug("MacUsbMonitor: IOKit monitoring started successfully", .{});
     }
 
     pub fn stop(self: *Self) void {
@@ -158,33 +184,103 @@ pub const MacUsbMonitor = struct {
         }
     }
 
+    fn shouldDebounceConnectEvent(self: *Self) bool {
+        const current_time = std.time.milliTimestamp();
+        const time_since_last_connect = current_time - self.last_connect_time;
+        const time_since_last_disconnect = current_time - self.last_disconnect_time;
+        
+        // If we just had a disconnect event recently, wait longer before allowing connect
+        if (time_since_last_disconnect < self.debounce_delay_ms) {
+            logger.debug("MacUsbMonitor: Debouncing connect event ({}ms since disconnect)", .{time_since_last_disconnect});
+            return true;
+        }
+        
+        // If we had a recent connect event, debounce
+        if (time_since_last_connect < self.debounce_delay_ms) {
+            logger.debug("MacUsbMonitor: Debouncing connect event ({}ms since last connect)", .{time_since_last_connect});
+            return true;
+        }
+        
+        self.last_connect_time = current_time;
+        self.device_state_stable = false; // Mark as unstable during transition
+        return false;
+    }
+
+    fn shouldDebounceDisconnectEvent(self: *Self) bool {
+        const current_time = std.time.milliTimestamp();
+        const time_since_last_disconnect = current_time - self.last_disconnect_time;
+        const time_since_last_connect = current_time - self.last_connect_time;
+        
+        // If we just had a connect event recently, wait longer before allowing disconnect
+        if (time_since_last_connect < self.debounce_delay_ms) {
+            logger.debug("MacUsbMonitor: Debouncing disconnect event ({}ms since connect)", .{time_since_last_connect});
+            return true;
+        }
+        
+        // If we had a recent disconnect event, debounce
+        if (time_since_last_disconnect < self.debounce_delay_ms) {
+            logger.debug("MacUsbMonitor: Debouncing disconnect event ({}ms since last disconnect)", .{time_since_last_disconnect});
+            return true;
+        }
+        
+        self.last_disconnect_time = current_time;
+        self.device_state_stable = false; // Mark as unstable during transition
+        return false;
+    }
+
     fn deviceAddedCallback(refcon: ?*anyopaque, iterator: c.io_iterator_t) callconv(.c) void {
-        if (refcon == null) return;
+        logger.debug("MacUsbMonitor: deviceAddedCallback called", .{});
+        if (refcon == null) {
+            logger.err("MacUsbMonitor: deviceAddedCallback called with null refcon", .{});
+            return;
+        }
 
         const self: *MacUsbMonitor = @ptrCast(@alignCast(refcon));
         self.handleDeviceAdded(iterator);
     }
 
     fn deviceRemovedCallback(refcon: ?*anyopaque, iterator: c.io_iterator_t) callconv(.c) void {
-        if (refcon == null) return;
+        logger.debug("MacUsbMonitor: deviceRemovedCallback called", .{});
+        if (refcon == null) {
+            logger.err("MacUsbMonitor: deviceRemovedCallback called with null refcon", .{});
+            return;
+        }
 
         const self: *MacUsbMonitor = @ptrCast(@alignCast(refcon));
         self.handleDeviceRemoved(iterator);
     }
 
     fn handleDeviceAdded(self: *Self, iterator: c.io_iterator_t) void {
+        logger.debug("MacUsbMonitor: handleDeviceAdded called", .{});
+        
+        // Check if we should debounce this connect event
+        if (self.shouldDebounceConnectEvent()) {
+            // Still need to consume the iterator to prevent memory leaks
+            var service: c.io_service_t = c.IOIteratorNext(iterator);
+            while (service != 0) {
+                _ = c.IOObjectRelease(service);
+                service = c.IOIteratorNext(iterator);
+            }
+            return;
+        }
+        
         var service: c.io_service_t = c.IOIteratorNext(iterator);
         while (service != 0) {
             defer _ = c.IOObjectRelease(service);
 
+            logger.debug("MacUsbMonitor: Processing added device service", .{});
             // Get device information and create UsbDevice
             if (self.createUsbDeviceFromService(service)) |device| {
+                logger.debug("MacUsbMonitor: Created device: {s}", .{device.name});
                 const event = daemon.UsbDeviceEvent.init(.connected, device);
                 if (self.monitor_ref) |monitor| {
+                    logger.debug("MacUsbMonitor: Triggering connected event", .{});
                     monitor.triggerEvent(event);
+                } else {
+                    logger.err("MacUsbMonitor: No monitor reference available", .{});
                 }
-            } else |_| {
-                // Failed to create device, continue with next
+            } else |err| {
+                logger.err("MacUsbMonitor: Failed to create device from service: {}", .{err});
             }
 
             service = c.IOIteratorNext(iterator);
@@ -192,18 +288,36 @@ pub const MacUsbMonitor = struct {
     }
 
     fn handleDeviceRemoved(self: *Self, iterator: c.io_iterator_t) void {
+        logger.debug("MacUsbMonitor: handleDeviceRemoved called", .{});
+        
+        // Check if we should debounce this disconnect event
+        if (self.shouldDebounceDisconnectEvent()) {
+            // Still need to consume the iterator to prevent memory leaks
+            var service: c.io_service_t = c.IOIteratorNext(iterator);
+            while (service != 0) {
+                _ = c.IOObjectRelease(service);
+                service = c.IOIteratorNext(iterator);
+            }
+            return;
+        }
+        
         var service: c.io_service_t = c.IOIteratorNext(iterator);
         while (service != 0) {
             defer _ = c.IOObjectRelease(service);
 
+            logger.debug("MacUsbMonitor: Processing removed device service", .{});
             // Get device information and create UsbDevice
             if (self.createUsbDeviceFromService(service)) |device| {
+                logger.debug("MacUsbMonitor: Created device for removal: {s}", .{device.name});
                 const event = daemon.UsbDeviceEvent.init(.disconnected, device);
                 if (self.monitor_ref) |monitor| {
+                    logger.debug("MacUsbMonitor: Triggering disconnected event", .{});
                     monitor.triggerEvent(event);
+                } else {
+                    logger.err("MacUsbMonitor: No monitor reference available", .{});
                 }
-            } else |_| {
-                // Failed to create device, continue with next
+            } else |err| {
+                logger.err("MacUsbMonitor: Failed to create device from service: {}", .{err});
             }
 
             service = c.IOIteratorNext(iterator);
@@ -298,7 +412,8 @@ pub const MacUsbMonitor = struct {
     
     fn getCFNumberProperty(self: *Self, properties: c.CFDictionaryRef, key: []const u8) ?u32 {
         _ = self;
-        const cf_key = c.CFStringCreateWithCString(c.kCFAllocatorDefault, key.ptr, c.kCFStringEncodingUTF8);
+        const cf_key = c.CFSt
+ingCreateWithCString(c.kCFAllocatorDefault, key.ptr, c.kCFStringEncodingUTF8);
         defer c.CFRelease(cf_key);
         
         const cf_value = c.CFDictionaryGetValue(properties, cf_key);

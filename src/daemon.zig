@@ -2,6 +2,7 @@ const std = @import("std");
 pub const UsbDevice = @import("usb_device.zig").UsbDevice;
 const UsbDeviceCollector = @import("collector.zig").UsbDeviceCollector;
 const Platform = @import("platform.zig").Platform;
+const logger = @import("logger.zig");
 
 // Platform-specific monitors
 const mac_monitor = if (@import("builtin").target.os.tag == .macos) @import("monitor/mac_monitor.zig") else struct {
@@ -9,7 +10,7 @@ const mac_monitor = if (@import("builtin").target.os.tag == .macos) @import("mon
         allocator: std.mem.Allocator,
         monitor_ref: ?*UsbDeviceMonitor,
         is_running: bool,
-        
+
         pub fn init(allocator: std.mem.Allocator, monitor_ref: *UsbDeviceMonitor) @This() {
             return .{
                 .allocator = allocator,
@@ -28,7 +29,7 @@ const windows_monitor = if (@import("builtin").target.os.tag == .windows) @impor
         allocator: std.mem.Allocator,
         monitor_ref: ?*UsbDeviceMonitor,
         is_running: bool,
-        
+
         pub fn init(allocator: std.mem.Allocator, monitor_ref: *UsbDeviceMonitor) @This() {
             return .{
                 .allocator = allocator,
@@ -47,7 +48,7 @@ const linux_monitor = if (@import("builtin").target.os.tag == .linux) @import("m
         allocator: std.mem.Allocator,
         monitor_ref: ?*UsbDeviceMonitor,
         is_running: bool,
-        
+
         pub fn init(allocator: std.mem.Allocator, monitor_ref: *UsbDeviceMonitor) @This() {
             return .{
                 .allocator = allocator,
@@ -91,14 +92,17 @@ pub const UsbDeviceMonitor = struct {
     should_stop: bool,
     collector: UsbDeviceCollector,
     
+    // Store the callback function
+    event_callback: ?DeviceEventCallback,
+    
     // Platform-specific monitor instances
     mac_monitor_instance: ?mac_monitor.MacUsbMonitor,
     windows_monitor_instance: ?windows_monitor.WindowsUsbMonitor,
     linux_monitor_instance: ?linux_monitor.LinuxUsbMonitor,
-    
+
     // Callback function type for device events
-    pub const DeviceEventCallback = *const fn (event: DeviceEvent, device: ?UsbDevice) void;
-    
+    pub const DeviceEventCallback = *const fn (monitor: *UsbDeviceMonitor, event: DeviceEvent, device: ?UsbDevice) void;
+
     const Self = @This();
 
     /// Initialize a new USB device monitor
@@ -110,11 +114,12 @@ pub const UsbDeviceMonitor = struct {
             .is_running = false,
             .should_stop = false,
             .collector = UsbDeviceCollector.init(allocator),
+            .event_callback = null,
             .mac_monitor_instance = null,
             .windows_monitor_instance = null,
             .linux_monitor_instance = null,
         };
-        
+
         // Initialize platform-specific monitor after self is created
         if (platform == .mac and @import("builtin").target.os.tag == .macos) {
             self.mac_monitor_instance = mac_monitor.MacUsbMonitor.init(allocator, &self);
@@ -123,7 +128,7 @@ pub const UsbDeviceMonitor = struct {
         } else if (platform == .linux and @import("builtin").target.os.tag == .linux) {
             self.linux_monitor_instance = linux_monitor.LinuxUsbMonitor.init(allocator, &self);
         }
-        
+
         return self;
     }
 
@@ -153,6 +158,7 @@ pub const UsbDeviceMonitor = struct {
 
         self.is_running = true;
         self.should_stop = false;
+        self.event_callback = callback;
 
         switch (self.platform) {
             .mac => {
@@ -160,7 +166,7 @@ pub const UsbDeviceMonitor = struct {
                     // Set the monitor reference for the mac monitor
                     monitor.monitor_ref = self;
                     try monitor.start();
-                    
+
                     // Run the monitoring loop
                     try self.runMacMonitorLoop(callback);
                 } else {
@@ -172,7 +178,7 @@ pub const UsbDeviceMonitor = struct {
                     // Set the monitor reference for the windows monitor
                     monitor.monitor_ref = self;
                     try monitor.start();
-                    
+
                     // Run the monitoring loop
                     try self.runWindowsMonitorLoop(callback);
                 } else {
@@ -184,7 +190,7 @@ pub const UsbDeviceMonitor = struct {
                     // Set the monitor reference for the linux monitor
                     monitor.monitor_ref = self;
                     try monitor.start();
-                    
+
                     // Run the monitoring loop
                     try self.runLinuxMonitorLoop(callback);
                 } else {
@@ -198,7 +204,7 @@ pub const UsbDeviceMonitor = struct {
     /// Stop monitoring
     pub fn stop(self: *Self) void {
         if (!self.is_running) return;
-        
+
         self.should_stop = true;
         self.is_running = false;
 
@@ -234,35 +240,69 @@ pub const UsbDeviceMonitor = struct {
 
     /// Trigger a device event (called by platform-specific monitors)
     pub fn triggerEvent(self: *Self, event: UsbDeviceEvent) void {
-        _ = self;
+        // Log the event for debugging
         switch (event.event_type) {
             .connected => {
                 if (event.device) |device| {
-                    std.log.debug("Device connected: {?s} (VID: {s}, PID: {s})", .{ device.product_name, device.vendor_id, device.product_id });
+                    logger.debug("Device connected: {?s} (VID: {s}, PID: {s})", .{ device.product_name, device.vendor_id, device.product_id });
                 } else {
-                    std.log.debug("Device connected: Unknown device", .{});
+                    logger.debug("Device connected: Unknown device", .{});
                 }
             },
             .disconnected => {
                 if (event.device) |device| {
-                    std.log.debug("Device disconnected: {?s} (VID: {s}, PID: {s})", .{ device.product_name, device.vendor_id, device.product_id });
+                    logger.debug("Device disconnected: {?s} (VID: {s}, PID: {s})", .{ device.product_name, device.vendor_id, device.product_id });
                 } else {
-                    std.log.debug("Device disconnected: Unknown device", .{});
+                    logger.debug("Device disconnected: Unknown device", .{});
                 }
             },
             .err => {
-                std.log.err("USB device error occurred", .{});
+                logger.err("USB device error occurred", .{});
             },
+        }
+        
+        // Call the user-provided callback if available
+        if (self.event_callback) |callback| {
+            callback(self, event.event_type, event.device);
         }
     }
 
     /// Run macOS-specific monitoring loop
     fn runMacMonitorLoop(self: *Self, _: DeviceEventCallback) !void {
         // The actual monitoring is handled by IOKit notifications in mac_monitor.zig
-        // This function just keeps the daemon alive
+        // We need to run the Core Foundation run loop for IOKit notifications to work
+        const c = @cImport({
+            @cInclude("CoreFoundation/CoreFoundation.h");
+        });
+        
+        logger.debug("Starting Core Foundation run loop for IOKit notifications...", .{});
+        
         while (self.is_running and !self.should_stop) {
-            std.Thread.sleep(100 * std.time.ns_per_ms); // Sleep for 100ms
+            // Run the run loop for a short time to process IOKit notifications
+            const result = c.CFRunLoopRunInMode(c.kCFRunLoopDefaultMode, 0.1, 1); // Run for 0.1 seconds
+            
+            switch (result) {
+                c.kCFRunLoopRunFinished => {
+                    logger.debug("Run loop finished", .{});
+                    break;
+                },
+                c.kCFRunLoopRunStopped => {
+                    logger.debug("Run loop stopped", .{});
+                    break;
+                },
+                c.kCFRunLoopRunTimedOut => {
+                    // Normal timeout, continue
+                },
+                c.kCFRunLoopRunHandledSource => {
+                    logger.debug("Run loop handled source", .{});
+                },
+                else => {
+                    logger.debug("Run loop returned: {}", .{result});
+                },
+            }
         }
+        
+        logger.debug("Exiting Core Foundation run loop", .{});
     }
 
     /// Run Windows-specific monitoring loop
@@ -303,7 +343,7 @@ pub const UsbDeviceMonitor = struct {
                     callback(.connected, device);
                 }
             } else |err| {
-                std.log.err("Failed to collect USB devices: {}", .{err});
+                logger.err("Failed to collect USB devices: {}", .{err});
                 callback(.err, null);
             }
         }
@@ -313,27 +353,32 @@ pub const UsbDeviceMonitor = struct {
     fn devicesEqual(self: *const Self, device1: UsbDevice, device2: UsbDevice) bool {
         _ = self;
         return std.mem.eql(u8, device1.vendor_id, device2.vendor_id) and
-               std.mem.eql(u8, device1.product_id, device2.product_id) and
-               std.mem.eql(u8, device1.name, device2.name);
+            std.mem.eql(u8, device1.product_id, device2.product_id) and
+            std.mem.eql(u8, device1.name, device2.name);
     }
 
     /// Handle device events (called by platform-specific monitors)
     pub fn handleDeviceEvent(self: *Self, event: DeviceEvent, device: ?UsbDevice) void {
-        _ = self;
+        // Log the event for debugging
         switch (event) {
             .connected => {
                 if (device) |dev| {
-                    std.log.debug("USB device connected: {s}", .{dev.name});
+                    logger.debug("USB device connected: {s}", .{dev.name});
                 }
             },
             .disconnected => {
                 if (device) |dev| {
-                    std.log.debug("USB device disconnected: {s}", .{dev.name});
+                    logger.debug("USB device disconnected: {s}", .{dev.name});
                 }
             },
             .err => {
-                std.log.err("USB monitoring error occurred", .{});
+                logger.err("USB monitoring error occurred", .{});
             },
+        }
+        
+        // Call the user-provided callback if available
+        if (self.event_callback) |callback| {
+            callback(self, event, device);
         }
     }
 };

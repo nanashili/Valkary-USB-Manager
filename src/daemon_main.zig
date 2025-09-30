@@ -1,30 +1,10 @@
 const std = @import("std");
 const daemon = @import("daemon.zig");
 const UsbDevice = @import("usb_device.zig").UsbDevice;
+const logger = @import("logger.zig");
 
-/// Log level configuration
-const LogLevel = enum {
-    debug,
-    info,
-    warn,
-    err,
-    
-    pub fn fromString(str: []const u8) ?LogLevel {
-        if (std.mem.eql(u8, str, "debug")) {
-            return .debug;
-        } else if (std.mem.eql(u8, str, "info")) {
-            return .info;
-        } else if (std.mem.eql(u8, str, "warn")) {
-            return .warn;
-        } else if (std.mem.eql(u8, str, "error")) {
-            return .err;
-        }
-        return null;
-    }
-};
-
-/// Global log level setting
-var global_log_level: LogLevel = .info;
+/// Use LogLevel from logger module
+const LogLevel = logger.LogLevel;
 
 /// Command line arguments structure
 const Args = struct {
@@ -130,7 +110,7 @@ fn printHelp() void {
 
 /// Device event callback function
 /// Handle device events for foreground mode
-fn onDeviceEvent(event: daemon.DeviceEvent, device: ?daemon.UsbDevice) void {
+fn onDeviceEvent(monitor: *daemon.UsbDeviceMonitor, event: daemon.DeviceEvent, device: ?daemon.UsbDevice) void {
     const timestamp = std.time.timestamp();
     const seconds_in_day = @mod(timestamp, 86400);
     const hours = @divTrunc(seconds_in_day, 3600);
@@ -140,31 +120,45 @@ fn onDeviceEvent(event: daemon.DeviceEvent, device: ?daemon.UsbDevice) void {
     switch (event) {
         .connected => {
             if (device) |dev| {
-                std.log.info("[{:02}:{:02}:{:02}] Device connected: {s} (VID: {s}, PID: {s})", .{
-                    hours, minutes, seconds, dev.name, dev.vendor_id, dev.product_id
-                });
-            } else {
-                std.log.info("[{:02}:{:02}:{:02}] Device connected: Unknown device", .{ hours, minutes, seconds });
+                logger.info("[{:02}:{:02}:{:02}] Device connected: {s} (VID: {s}, PID: {s})", .{
+                     hours, minutes, seconds, dev.name, dev.vendor_id, dev.product_id
+                 });
+    } else {
+        logger.info("[{:02}:{:02}:{:02}] Device connected: Unknown device", .{ hours, minutes, seconds });
             }
         },
         .disconnected => {
             if (device) |dev| {
-                std.log.info("[{:02}:{:02}:{:02}] Device disconnected: {s} (VID: {s}, PID: {s})", .{
+                logger.info("[{:02}:{:02}:{:02}] Device disconnected: {s} (VID: {s}, PID: {s})", .{
                     hours, minutes, seconds, dev.name, dev.vendor_id, dev.product_id
                 });
             } else {
-                std.log.info("[{:02}:{:02}:{:02}] Device disconnected: Unknown device", .{ hours, minutes, seconds });
+                logger.info("[{:02}:{:02}:{:02}] Device disconnected: Unknown device", .{ hours, minutes, seconds });
             }
         },
         .err => {
-            std.log.err("[{:02}:{:02}:{:02}] USB monitoring error occurred", .{ hours, minutes, seconds });
+            logger.err("[{:02}:{:02}:{:02}] USB monitoring error occurred", .{ hours, minutes, seconds });
         },
     }
+    
+    // Get and display current device count after each event
+    const current_devices = monitor.collector.listUsbDevices() catch |err| {
+        logger.err("Failed to get current device list: {}", .{err});
+        return;
+    };
+    defer {
+        for (current_devices) |*dev| {
+            dev.deinit(monitor.allocator);
+        }
+        monitor.allocator.free(current_devices);
+    }
+    
+    logger.info("Currently connected devices: {}", .{current_devices.len});
 }
 
 /// Start daemon in foreground mode
 fn startForeground(allocator: std.mem.Allocator, log_level: LogLevel) !void {
-    global_log_level = log_level;
+    logger.setLogLevel(log_level);
     
     var monitor = daemon.UsbDeviceMonitor.init(allocator);
     defer monitor.deinit();
@@ -172,16 +166,16 @@ fn startForeground(allocator: std.mem.Allocator, log_level: LogLevel) !void {
     // Set up signal handler for graceful shutdown
     try daemon.setupSignalHandler(&monitor);
     
-    std.log.info("USB Device Daemon starting on platform: {any}", .{monitor.getPlatform()});
+    logger.info("USB Device Daemon starting on platform: {any}", .{monitor.getPlatform()});
     
-    if (!monitor.getPlatform().isSupported()) {
-        std.log.err("USB monitoring is not supported on this platform", .{});
+    if (!monitor.platform.isSupported()) {
+        logger.err("USB monitoring is not supported on this platform", .{});
         return;
     }
     
-    // Get initial device count
+    // Get initial device list
     const initial_devices = monitor.collector.listUsbDevices() catch |err| {
-        std.log.err("Failed to get initial device list: {}", .{err});
+        logger.err("Failed to get initial device list: {}", .{err});
         return;
     };
     defer {
@@ -191,22 +185,20 @@ fn startForeground(allocator: std.mem.Allocator, log_level: LogLevel) !void {
         allocator.free(initial_devices);
     }
     
-    std.log.info("Currently connected devices: {}", .{initial_devices.len});
-    if (global_log_level == .debug) {
-        for (initial_devices, 0..) |device, i| {
-            std.log.debug("  {}. {s} (VID: {s}, PID: {s})", .{ i + 1, device.name, device.vendor_id, device.product_id });
-        }
+    logger.info("Currently connected devices: {}", .{initial_devices.len});
+    for (initial_devices, 0..) |device, i| {
+        logger.debug("  {}. {s} (VID: {s}, PID: {s})", .{ i + 1, device.name, device.vendor_id, device.product_id });
     }
     
-    std.log.info("Starting USB device monitoring...", .{});
+    logger.info("Starting USB device monitoring...", .{});
     
-    // Start monitoring
+    // Start monitoring with our callback
     monitor.start(onDeviceEvent) catch |err| {
-        std.log.err("Failed to start monitor: {}", .{err});
+        logger.err("Failed to start monitor: {}", .{err});
         return;
     };
     
-    std.log.info("USB daemon stopped gracefully", .{});
+    logger.info("USB daemon stopped gracefully", .{});
 }
 
 /// Main entry point
@@ -216,37 +208,37 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     
     const args = parseArgs(allocator) catch |err| {
-        std.log.err("Error parsing arguments: {}", .{err});
+        logger.err("Error parsing arguments: {}", .{err});
         return;
     };
     
     // Set global log level
-    global_log_level = args.log_level;
+    logger.setLogLevel(args.log_level);
     
     switch (args.command) {
         .help => printHelp(),
         .start_fg => {
             startForeground(allocator, args.log_level) catch |err| {
-                std.log.err("Daemon error: {}", .{err});
+                logger.err("Daemon error: {}", .{err});
                 std.process.exit(1);
             };
         },
         .start => {
-            std.log.err("Background mode is not yet implemented", .{});
+            logger.err("Background mode is not yet implemented", .{});
             if (args.log_level == .debug or args.log_level == .info) {
-                std.log.info("Use 'start-fg' for foreground mode", .{});
+                logger.info("Use 'start-fg' for foreground mode", .{});
             }
             std.process.exit(1);
         },
         .stop => {
-            std.log.err("Daemon management is not yet implemented", .{});
+            logger.err("Daemon management is not yet implemented", .{});
             if (args.log_level == .debug or args.log_level == .info) {
-                std.log.info("Use Ctrl+C to stop a running foreground daemon", .{});
+                logger.info("Use Ctrl+C to stop a running foreground daemon", .{});
             }
             std.process.exit(1);
         },
         .status => {
-            std.log.err("Status checking is not yet implemented", .{});
+            logger.err("Status checking is not yet implemented", .{});
             std.process.exit(1);
         },
     }

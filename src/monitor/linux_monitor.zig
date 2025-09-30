@@ -2,6 +2,7 @@ const std = @import("std");
 const daemon = @import("../daemon.zig");
 const UsbDevice = @import("../usb_device.zig").UsbDevice;
 const builtin = @import("builtin");
+const logger = @import("../logger.zig");
 
 // Only compile Linux-specific code when targeting Linux
 pub const LinuxUsbMonitor = if (builtin.target.os.tag == .linux) LinuxUsbMonitorImpl else LinuxUsbMonitorStub;
@@ -134,7 +135,7 @@ const LinuxUsbMonitorImpl = struct {
         // Start monitoring thread
         self.monitor_thread = try std.Thread.spawn(.{}, monitoringThread, .{self});
         
-        std.log.info("Linux real-time USB monitoring started (udev-based)", .{});
+        logger.info("Linux real-time USB monitoring started (udev-based)", .{});
     }
 
     pub fn stop(self: *Self) void {
@@ -148,12 +149,12 @@ const LinuxUsbMonitorImpl = struct {
             self.monitor_thread = null;
         }
         
-        std.log.info("Linux USB monitoring stopped", .{});
+        logger.info("Linux USB monitoring stopped", .{});
     }
 
     fn monitoringThread(self: *Self) void {
         self.runUdevMonitoring() catch |err| {
-            std.log.err("Linux USB monitoring failed: {}", .{err});
+            logger.err("Linux USB monitoring failed: {}", .{err});
         };
     }
 
@@ -169,7 +170,7 @@ const LinuxUsbMonitorImpl = struct {
             const poll_result = poll(@ptrCast(&poll_fd), 1, 1000);
             
             if (poll_result < 0) {
-                std.log.err("udev poll failed", .{});
+                logger.err("udev poll failed", .{});
                 break;
             }
             
@@ -203,7 +204,7 @@ const LinuxUsbMonitorImpl = struct {
                     monitor.handleDeviceEvent(.connected, usb_device);
                 }
             } else |err| {
-                std.log.debug("Failed to create USB device from udev: {}", .{err});
+                logger.debug("Failed to create USB device from udev: {}", .{err});
             }
         } else if (std.mem.eql(u8, action, "remove")) {
             // Device disconnected
@@ -212,8 +213,8 @@ const LinuxUsbMonitorImpl = struct {
                     monitor.handleDeviceEvent(.disconnected, usb_device);
                 }
             } else |err| {
-                std.log.debug("Failed to create USB device from udev: {}", .{err});
-            }
+                    logger.debug("Failed to create USB device from udev: {}", .{err});
+                }
         }
     }
 
